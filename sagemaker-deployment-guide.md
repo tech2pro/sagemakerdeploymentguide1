@@ -568,4 +568,3 @@ hub_config = {
 ## Note on QLora Fine-tuned Models
 
 This model (`HeyHey12Hey/codellama-7b-qlora-finetune`) is a QLora fine-tuned version of CodeLlama-7B. The adapter weights have been merged into the base model, so it deploys like a standard model. If you encounter issues with merged weights, you may need to use the `peft` library to load adapter weights separately.
-
