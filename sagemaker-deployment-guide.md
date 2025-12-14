@@ -1,5 +1,3 @@
-# Deploying codellama-7b-qlora-finetune to AWS SageMaker Endpoint
-
 **Model:** https://huggingface.co/HeyHey12Hey/codellama-7b-qlora-finetune
 
 ## Prerequisites
@@ -11,13 +9,28 @@
 
 ---
 
-## Step-by-Step Process
+## Deployment Timing in SageMaker Notebook
+
+| Step | Duration | Notes |
+|------|----------|-------|
+| Import & Setup | ~1-2 seconds | Instant |
+| Configure Model | ~1-2 seconds | Instant |
+| **Deploy Endpoint** | **5-15 minutes** | Downloads model, provisions instance |
+| Test Inference | ~2-10 seconds | First call may be slower (cold start) |
+
+**Total: ~5-15 minutes** (mostly waiting for deployment)
+
+---
+
+## Step-by-Step Process with Error Handling
 
 ### Step 1: Install Required Dependencies
 
 ```bash
 pip install sagemaker boto3 huggingface_hub
 ```
+
+Note: If running in a SageMaker notebook, these are already pre-installed.
 
 ### Step 2: Verify Model Access
 
@@ -30,71 +43,152 @@ pip install sagemaker boto3 huggingface_hub
 ```python
 import sagemaker
 import boto3
-from sagemaker.huggingface import HuggingFaceModel, get_huggingface_llm_image_uri
+import json
+import time
+from botocore.exceptions import ClientError, EndpointConnectionError
 
-# Initialize session
-sess = sagemaker.Session()
-role = sagemaker.get_execution_role()  # Or specify your IAM role ARN
-region = sess.boto_region_name
+# Setup with Error Handling
+try:
+    sess = sagemaker.Session()
+    role = sagemaker.get_execution_role()
+    region = sess.boto_region_name
+    print(f"[SUCCESS] Session initialized in region: {region}")
+except Exception as e:
+    print(f"[ERROR] Failed to initialize session: {str(e)}")
+    print("  -> Ensure you're running in a SageMaker notebook with proper IAM role")
+    raise
 ```
 
 ### Step 4: Configure the HuggingFace LLM Model
 
 ```python
-# Get the HuggingFace LLM Deep Learning Container URI
-llm_image = get_huggingface_llm_image_uri(
-    backend="huggingface",  # or "tgi" for Text Generation Inference
-    region=region
-)
+from sagemaker.huggingface import HuggingFaceModel, get_huggingface_llm_image_uri
 
-# Model configuration
+try:
+    llm_image = get_huggingface_llm_image_uri(
+        backend="huggingface",
+        region=region
+    )
+    print(f"[SUCCESS] Container image URI retrieved")
+except ValueError as e:
+    print(f"[ERROR] Failed to get container image: {str(e)}")
+    print("  -> HuggingFace LLM containers may not be available in this region")
+    raise
+
 hub_config = {
     'HF_MODEL_ID': 'HeyHey12Hey/codellama-7b-qlora-finetune',
-    'SM_NUM_GPUS': '1',  # Number of GPUs
+    'SM_NUM_GPUS': '1',
     'MAX_INPUT_LENGTH': '2048',
     'MAX_TOTAL_TOKENS': '4096',
     # 'HF_TOKEN': '<YOUR_HUGGINGFACE_TOKEN>',  # Optional - only if rate limited
 }
 
-# Create HuggingFace Model
-huggingface_model = HuggingFaceModel(
-    image_uri=llm_image,
-    env=hub_config,
-    role=role,
-)
+try:
+    huggingface_model = HuggingFaceModel(
+        image_uri=llm_image,
+        env=hub_config,
+        role=role,
+    )
+    print("[SUCCESS] HuggingFace model configured")
+except Exception as e:
+    print(f"[ERROR] Failed to configure model: {str(e)}")
+    raise
 ```
 
 ### Step 5: Deploy the Model to an Endpoint
 
 ```python
-# Deploy to SageMaker endpoint
-# CodeLlama-7b can run on ml.g5.xlarge (1 GPU, 24GB VRAM) or ml.g5.2xlarge
-# 7B models are smaller and more cost-effective than 13B
+ENDPOINT_NAME = "codellama-7b-qlora-endpoint"
 
-predictor = huggingface_model.deploy(
-    initial_instance_count=1,
-    instance_type="ml.g5.xlarge",  # GPU instance - sufficient for 7B model
-    endpoint_name="codellama-7b-qlora-endpoint",  # Optional custom name
-)
+try:
+    print(f"Deploying endpoint '{ENDPOINT_NAME}'...")
+    print("  This typically takes 5-15 minutes. Please wait...")
+
+    start_time = time.time()
+
+    predictor = huggingface_model.deploy(
+        initial_instance_count=1,
+        instance_type="ml.g5.xlarge",
+        endpoint_name=ENDPOINT_NAME,
+        container_startup_health_check_timeout=600,  # 10 min timeout for model loading
+    )
+
+    elapsed = (time.time() - start_time) / 60
+    print(f"[SUCCESS] Endpoint deployed successfully in {elapsed:.1f} minutes")
+
+except ClientError as e:
+    error_code = e.response['Error']['Code']
+    error_msg = e.response['Error']['Message']
+
+    if error_code == 'ResourceLimitExceeded':
+        print(f"[ERROR] Resource limit exceeded: {error_msg}")
+        print("  -> Request a quota increase for ml.g5.xlarge in Service Quotas")
+    elif error_code == 'ResourceInUse':
+        print(f"[ERROR] Endpoint name already exists: {ENDPOINT_NAME}")
+        print("  -> Delete existing endpoint or use a different name")
+    elif error_code == 'ValidationException':
+        print(f"[ERROR] Validation error: {error_msg}")
+        print("  -> Check instance type availability in your region")
+    else:
+        print(f"[ERROR] AWS error ({error_code}): {error_msg}")
+    raise
+
+except Exception as e:
+    print(f"[ERROR] Deployment failed: {str(e)}")
+    raise
 ```
-
-**Note:** Deployment typically takes 5-10 minutes as SageMaker downloads the model weights (~14GB for 7B model).
 
 ### Step 6: Test the Endpoint
 
 ```python
-# Test inference
-response = predictor.predict({
-    "inputs": "def fibonacci(n):",
-    "parameters": {
-        "max_new_tokens": 256,
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "do_sample": True,
-    }
-})
+def invoke_endpoint(prompt, max_new_tokens=256, temperature=0.7):
+    """Invoke the endpoint with error handling."""
+    try:
+        response = predictor.predict({
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "top_p": 0.9,
+                "do_sample": True,
+            }
+        })
+        return response
 
-print(response)
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        error_msg = e.response['Error']['Message']
+
+        if error_code == 'ModelError':
+            print(f"[ERROR] Model error: {error_msg}")
+            print("  -> The model may have failed to load or crashed")
+        elif error_code == 'ValidationError':
+            print(f"[ERROR] Invalid input: {error_msg}")
+            print("  -> Check your prompt format and parameters")
+        elif error_code == 'ThrottlingException':
+            print(f"[ERROR] Rate limited: {error_msg}")
+            print("  -> Wait and retry, or increase instance count")
+        else:
+            print(f"[ERROR] Inference error ({error_code}): {error_msg}")
+        raise
+
+    except EndpointConnectionError:
+        print("[ERROR] Cannot connect to endpoint")
+        print("  -> Check if endpoint is still running")
+        raise
+
+    except json.JSONDecodeError:
+        print("[ERROR] Invalid response format from model")
+        raise
+
+# Test the endpoint
+try:
+    print("Testing endpoint...")
+    result = invoke_endpoint("def fibonacci(n):")
+    print("[SUCCESS] Inference successful!")
+    print(f"Response: {result}")
+except Exception as e:
+    print(f"[ERROR] Test failed: {str(e)}")
 ```
 
 ### Step 7: Invoke from External Applications (Optional)
@@ -125,12 +219,44 @@ print(result)
 ### Step 8: Clean Up (When Done)
 
 ```python
-# Delete endpoint to stop incurring charges
-predictor.delete_endpoint()
+def cleanup_endpoint(predictor):
+    """Delete endpoint and model with error handling."""
+    try:
+        print("Deleting endpoint...")
+        predictor.delete_endpoint()
+        print("[SUCCESS] Endpoint deleted")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFound':
+            print("  Endpoint already deleted")
+        else:
+            print(f"[ERROR] Failed to delete endpoint: {str(e)}")
 
-# Optionally delete the model
-predictor.delete_model()
+    try:
+        print("Deleting model...")
+        predictor.delete_model()
+        print("[SUCCESS] Model deleted")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFound':
+            print("  Model already deleted")
+        else:
+            print(f"[ERROR] Failed to delete model: {str(e)}")
+
+# Run cleanup when done (uncomment when ready):
+# cleanup_endpoint(predictor)
 ```
+
+---
+
+## Common Errors and Solutions
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `ResourceLimitExceeded` | No quota for instance type | Request quota increase in AWS console |
+| `ResourceInUse` | Endpoint name exists | Delete existing or use new name |
+| `ModelError` | Model failed to load | Check CloudWatch logs, try larger instance |
+| `ThrottlingException` | Too many requests | Add retry logic with backoff |
+| `Timeout` | Model too slow to load | Increase `container_startup_health_check_timeout` |
+| `ValidationException` | Invalid instance type | Check instance availability in region |
 
 ---
 
@@ -166,15 +292,6 @@ hub_config = {
 
 ---
 
-## Troubleshooting
-
-1. **Model download timeout**: Increase `container_startup_health_check_timeout` in deploy()
-2. **Out of memory**: Use a larger instance (ml.g5.2xlarge) or enable quantization
-3. **Rate limited**: Add HF_TOKEN to environment config
-4. **Slow inference**: Consider TGI backend or larger instance
-
----
-
 ## Cost Considerations
 
 - **Endpoint costs**: Charged per hour while running (~$1.00/hr for g5.xlarge)
@@ -182,6 +299,8 @@ hub_config = {
 - **Data transfer**: Ingress free, egress charged
 
 **Tip**: Use SageMaker Serverless Inference or Asynchronous Inference for cost optimization if real-time isn't required.
+
+---
 
 ## Note on QLora Fine-tuned Models
 
