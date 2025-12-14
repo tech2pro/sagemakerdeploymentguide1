@@ -1,3 +1,4 @@
+# Deploying codellama-7b-qlora-finetune to AWS SageMaker Endpoint
 
 **Model:** https://huggingface.co/HeyHey12Hey/codellama-7b-qlora-finetune
 
@@ -64,57 +65,241 @@ except Exception as e:
 
 **Note:** GovCloud cannot access public AWS ECR. You must copy the HuggingFace container to your GovCloud ECR.
 
-#### Option A: Run from a machine with access to BOTH commercial AWS and GovCloud
+---
 
-**Prerequisites:**
-- Docker installed
-- AWS CLI configured with both commercial and GovCloud profiles
+#### Prerequisites
+
+1. **Docker Desktop** installed and running
+   - Download: https://www.docker.com/products/docker-desktop
+   - Verify: `docker --version`
+
+2. **AWS CLI v2** installed
+   - Download: https://aws.amazon.com/cli/
+   - Verify: `aws --version`
+
+3. **AWS CLI Profiles** configured for both environments:
 
 ```bash
-# ============================================
-# Run these commands in a terminal (not notebook)
-# ============================================
+# Configure commercial AWS profile
+aws configure --profile commercial
+# Enter: Access Key, Secret Key, Region (us-east-1), Output (json)
 
-# Variables - UPDATE THESE
-GOVCLOUD_ACCOUNT_ID="your-govcloud-account-id"
-GOVCLOUD_REGION="us-gov-west-1"
-COMMERCIAL_REGION="us-east-1"
-ECR_REPO_NAME="huggingface-llm-tgi"
+# Configure GovCloud profile
+aws configure --profile govcloud
+# Enter: GovCloud Access Key, Secret Key, Region (us-gov-west-1), Output (json)
+```
 
-# Source image from commercial AWS (HuggingFace TGI container)
-SOURCE_IMAGE="763104351884.dkr.ecr.${COMMERCIAL_REGION}.amazonaws.com/huggingface-pytorch-tgi-inference:2.1.1-tgi1.4.0-gpu-py310-cu121-ubuntu20.04"
+4. **IAM Permissions Required:**
+   - Commercial AWS: `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`
+   - GovCloud: `ecr:CreateRepository`, `ecr:GetAuthorizationToken`, `ecr:PutImage`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:BatchCheckLayerAvailability`
 
-# Target image in GovCloud ECR
-TARGET_IMAGE="${GOVCLOUD_ACCOUNT_ID}.dkr.ecr.${GOVCLOUD_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest"
+---
 
-# Step 1: Login to commercial AWS ECR
-aws ecr get-login-password --region ${COMMERCIAL_REGION} --profile commercial | \
-    docker login --username AWS --password-stdin 763104351884.dkr.ecr.${COMMERCIAL_REGION}.amazonaws.com
+#### Step 3.5.1: Set Environment Variables
 
-# Step 2: Pull the HuggingFace container
+Open a terminal and set these variables:
+
+```bash
+# UPDATE THESE VALUES
+export GOVCLOUD_ACCOUNT_ID="123456789012"      # Your 12-digit GovCloud account ID
+export GOVCLOUD_REGION="us-gov-west-1"          # GovCloud region
+export COMMERCIAL_REGION="us-east-1"            # Commercial region for source image
+export ECR_REPO_NAME="huggingface-llm-tgi"      # Name for your ECR repository
+
+# Source image (HuggingFace TGI container from commercial AWS)
+export SOURCE_IMAGE="763104351884.dkr.ecr.${COMMERCIAL_REGION}.amazonaws.com/huggingface-pytorch-tgi-inference:2.1.1-tgi1.4.0-gpu-py310-cu121-ubuntu20.04"
+
+# Target image in GovCloud
+export TARGET_IMAGE="${GOVCLOUD_ACCOUNT_ID}.dkr.ecr.${GOVCLOUD_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest"
+
+# Verify variables are set
+echo "Source: ${SOURCE_IMAGE}"
+echo "Target: ${TARGET_IMAGE}"
+```
+
+---
+
+#### Step 3.5.2: Login to Commercial AWS ECR
+
+```bash
+# Get login token from commercial AWS and authenticate Docker
+aws ecr get-login-password \
+    --region ${COMMERCIAL_REGION} \
+    --profile commercial | \
+docker login \
+    --username AWS \
+    --password-stdin 763104351884.dkr.ecr.${COMMERCIAL_REGION}.amazonaws.com
+
+# Expected output: "Login Succeeded"
+```
+
+**Troubleshooting:**
+- "Access Denied": Check IAM permissions for ECR read access
+- "Network error": Ensure internet connectivity to AWS
+
+---
+
+#### Step 3.5.3: Pull the HuggingFace Container Image
+
+```bash
+# Pull the container image (this may take 10-20 minutes, ~15GB)
 docker pull ${SOURCE_IMAGE}
 
-# Step 3: Create ECR repository in GovCloud (if not exists)
+# Verify the image was pulled
+docker images | grep huggingface
+
+# Expected output shows the image with size ~15GB
+```
+
+**Troubleshooting:**
+- "No space left on device": Free up Docker disk space or increase Docker Desktop disk limit
+- "Timeout": Retry, or check network connection
+
+---
+
+#### Step 3.5.4: Create ECR Repository in GovCloud
+
+```bash
+# Create the ECR repository in GovCloud
 aws ecr create-repository \
     --repository-name ${ECR_REPO_NAME} \
     --region ${GOVCLOUD_REGION} \
     --profile govcloud \
-    2>/dev/null || echo "Repository may already exist"
+    --image-scanning-configuration scanOnPush=true
 
-# Step 4: Login to GovCloud ECR
-aws ecr get-login-password --region ${GOVCLOUD_REGION} --profile govcloud | \
-    docker login --username AWS --password-stdin ${GOVCLOUD_ACCOUNT_ID}.dkr.ecr.${GOVCLOUD_REGION}.amazonaws.com
+# Expected output: JSON with repository details including repositoryUri
+```
 
-# Step 5: Tag and push to GovCloud ECR
+**If repository already exists:**
+```bash
+# Check if repository exists
+aws ecr describe-repositories \
+    --repository-names ${ECR_REPO_NAME} \
+    --region ${GOVCLOUD_REGION} \
+    --profile govcloud
+```
+
+**Troubleshooting:**
+- "RepositoryAlreadyExistsException": Repository exists, proceed to next step
+- "AccessDeniedException": Check IAM permissions for ecr:CreateRepository
+
+---
+
+#### Step 3.5.5: Login to GovCloud ECR
+
+```bash
+# Get login token from GovCloud and authenticate Docker
+aws ecr get-login-password \
+    --region ${GOVCLOUD_REGION} \
+    --profile govcloud | \
+docker login \
+    --username AWS \
+    --password-stdin ${GOVCLOUD_ACCOUNT_ID}.dkr.ecr.${GOVCLOUD_REGION}.amazonaws.com
+
+# Expected output: "Login Succeeded"
+```
+
+---
+
+#### Step 3.5.6: Tag the Image for GovCloud ECR
+
+```bash
+# Tag the pulled image with the GovCloud ECR target
+docker tag ${SOURCE_IMAGE} ${TARGET_IMAGE}
+
+# Verify the tag was created
+docker images | grep ${ECR_REPO_NAME}
+
+# Should show the image tagged with your GovCloud ECR URI
+```
+
+---
+
+#### Step 3.5.7: Push the Image to GovCloud ECR
+
+```bash
+# Push the image to GovCloud ECR (this may take 20-40 minutes depending on network)
+docker push ${TARGET_IMAGE}
+
+# Expected output: Multiple "Pushed" messages for each layer
+```
+
+**Troubleshooting:**
+- "Retrying in X seconds": Network issues, will auto-retry
+- "denied: Your authorization token has expired": Re-run Step 3.5.5 to login again
+- "timeout": Check network, increase Docker timeout settings
+
+---
+
+#### Step 3.5.8: Verify the Image in GovCloud ECR
+
+```bash
+# List images in the repository
+aws ecr list-images \
+    --repository-name ${ECR_REPO_NAME} \
+    --region ${GOVCLOUD_REGION} \
+    --profile govcloud
+
+# Expected output: JSON showing imageDigest and imageTag "latest"
+
+# Get the full image URI for use in SageMaker
+echo "Use this image URI in SageMaker:"
+echo "${TARGET_IMAGE}"
+```
+
+---
+
+#### Step 3.5.9: (Optional) Clean Up Local Docker Images
+
+```bash
+# Remove local images to free up disk space
+docker rmi ${SOURCE_IMAGE}
+docker rmi ${TARGET_IMAGE}
+
+# Verify removal
+docker images | grep huggingface
+```
+
+---
+
+#### Quick Reference - All Commands
+
+```bash
+# Set variables
+export GOVCLOUD_ACCOUNT_ID="123456789012"
+export GOVCLOUD_REGION="us-gov-west-1"
+export COMMERCIAL_REGION="us-east-1"
+export ECR_REPO_NAME="huggingface-llm-tgi"
+export SOURCE_IMAGE="763104351884.dkr.ecr.${COMMERCIAL_REGION}.amazonaws.com/huggingface-pytorch-tgi-inference:2.1.1-tgi1.4.0-gpu-py310-cu121-ubuntu20.04"
+export TARGET_IMAGE="${GOVCLOUD_ACCOUNT_ID}.dkr.ecr.${GOVCLOUD_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest"
+
+# Login to commercial AWS ECR
+aws ecr get-login-password --region ${COMMERCIAL_REGION} --profile commercial | docker login --username AWS --password-stdin 763104351884.dkr.ecr.${COMMERCIAL_REGION}.amazonaws.com
+
+# Pull image
+docker pull ${SOURCE_IMAGE}
+
+# Create GovCloud ECR repo
+aws ecr create-repository --repository-name ${ECR_REPO_NAME} --region ${GOVCLOUD_REGION} --profile govcloud 2>/dev/null || echo "Repo exists"
+
+# Login to GovCloud ECR
+aws ecr get-login-password --region ${GOVCLOUD_REGION} --profile govcloud | docker login --username AWS --password-stdin ${GOVCLOUD_ACCOUNT_ID}.dkr.ecr.${GOVCLOUD_REGION}.amazonaws.com
+
+# Tag and push
 docker tag ${SOURCE_IMAGE} ${TARGET_IMAGE}
 docker push ${TARGET_IMAGE}
 
-echo "[SUCCESS] Container pushed to GovCloud ECR: ${TARGET_IMAGE}"
+# Verify
+aws ecr list-images --repository-name ${ECR_REPO_NAME} --region ${GOVCLOUD_REGION} --profile govcloud
+
+echo "[SUCCESS] Image URI: ${TARGET_IMAGE}"
 ```
+
+---
 
 #### Option B: If containers are pre-staged in GovCloud ECR
 
-If your organization has already copied HuggingFace containers to GovCloud, get the ECR URI from your admin.
+If your organization has already copied HuggingFace containers to GovCloud, get the ECR URI from your admin and skip to Step 4.
 
 ---
 
