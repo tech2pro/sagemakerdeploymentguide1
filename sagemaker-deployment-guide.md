@@ -1,3 +1,4 @@
+
 **Model:** https://huggingface.co/HeyHey12Hey/codellama-7b-qlora-finetune
 
 ## Prerequisites
@@ -59,29 +60,106 @@ except Exception as e:
     raise
 ```
 
+### Step 3.5: Set Up ECR in GovCloud (Required for GovCloud)
+
+**Note:** GovCloud cannot access public AWS ECR. You must copy the HuggingFace container to your GovCloud ECR.
+
+#### Option A: Run from a machine with access to BOTH commercial AWS and GovCloud
+
+**Prerequisites:**
+- Docker installed
+- AWS CLI configured with both commercial and GovCloud profiles
+
+```bash
+# ============================================
+# Run these commands in a terminal (not notebook)
+# ============================================
+
+# Variables - UPDATE THESE
+GOVCLOUD_ACCOUNT_ID="your-govcloud-account-id"
+GOVCLOUD_REGION="us-gov-west-1"
+COMMERCIAL_REGION="us-east-1"
+ECR_REPO_NAME="huggingface-llm-tgi"
+
+# Source image from commercial AWS (HuggingFace TGI container)
+SOURCE_IMAGE="763104351884.dkr.ecr.${COMMERCIAL_REGION}.amazonaws.com/huggingface-pytorch-tgi-inference:2.1.1-tgi1.4.0-gpu-py310-cu121-ubuntu20.04"
+
+# Target image in GovCloud ECR
+TARGET_IMAGE="${GOVCLOUD_ACCOUNT_ID}.dkr.ecr.${GOVCLOUD_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest"
+
+# Step 1: Login to commercial AWS ECR
+aws ecr get-login-password --region ${COMMERCIAL_REGION} --profile commercial | \
+    docker login --username AWS --password-stdin 763104351884.dkr.ecr.${COMMERCIAL_REGION}.amazonaws.com
+
+# Step 2: Pull the HuggingFace container
+docker pull ${SOURCE_IMAGE}
+
+# Step 3: Create ECR repository in GovCloud (if not exists)
+aws ecr create-repository \
+    --repository-name ${ECR_REPO_NAME} \
+    --region ${GOVCLOUD_REGION} \
+    --profile govcloud \
+    2>/dev/null || echo "Repository may already exist"
+
+# Step 4: Login to GovCloud ECR
+aws ecr get-login-password --region ${GOVCLOUD_REGION} --profile govcloud | \
+    docker login --username AWS --password-stdin ${GOVCLOUD_ACCOUNT_ID}.dkr.ecr.${GOVCLOUD_REGION}.amazonaws.com
+
+# Step 5: Tag and push to GovCloud ECR
+docker tag ${SOURCE_IMAGE} ${TARGET_IMAGE}
+docker push ${TARGET_IMAGE}
+
+echo "[SUCCESS] Container pushed to GovCloud ECR: ${TARGET_IMAGE}"
+```
+
+#### Option B: If containers are pre-staged in GovCloud ECR
+
+If your organization has already copied HuggingFace containers to GovCloud, get the ECR URI from your admin.
+
+---
+
 ### Step 4: Configure the HuggingFace LLM Model
 
-```python
-from sagemaker.huggingface import HuggingFaceModel, get_huggingface_llm_image_uri
+**Note:** This model is in a private HuggingFace repository. You must provide a HuggingFace access token.
 
-try:
-    llm_image = get_huggingface_llm_image_uri(
-        backend="huggingface",
-        region=region
-    )
-    print(f"[SUCCESS] Container image URI retrieved")
-except ValueError as e:
-    print(f"[ERROR] Failed to get container image: {str(e)}")
-    print("  -> HuggingFace LLM containers may not be available in this region")
-    raise
+To generate a token:
+1. Go to https://huggingface.co/settings/tokens
+2. Click "New token"
+3. Select "Read" access
+4. Copy the token (starts with `hf_...`)
+
+```python
+from sagemaker.huggingface import HuggingFaceModel
+
+# ============================================
+# GovCloud ECR Configuration
+# ============================================
+# UPDATE with your GovCloud account ID
+GOVCLOUD_ACCOUNT_ID = "your-govcloud-account-id"
+GOVCLOUD_REGION = "us-gov-west-1"
+ECR_REPO_NAME = "huggingface-llm-tgi"
+
+# Use the container image from your GovCloud ECR
+llm_image = f"{GOVCLOUD_ACCOUNT_ID}.dkr.ecr.{GOVCLOUD_REGION}.amazonaws.com/{ECR_REPO_NAME}:latest"
+
+print(f"Using GovCloud ECR image: {llm_image}")
+
+# IMPORTANT: Replace with your HuggingFace token for private repo access
+HF_TOKEN = 'hf_xxxxxxxxxxxxxxxxxxxx'  # Your HuggingFace access token
 
 hub_config = {
     'HF_MODEL_ID': 'HeyHey12Hey/codellama-7b-qlora-finetune',
+    'HF_TOKEN': HF_TOKEN,  # Required for private repository access
     'SM_NUM_GPUS': '1',
     'MAX_INPUT_LENGTH': '2048',
     'MAX_TOTAL_TOKENS': '4096',
-    # 'HF_TOKEN': '<YOUR_HUGGINGFACE_TOKEN>',  # Optional - only if rate limited
 }
+
+# Validate token is set
+if HF_TOKEN == 'hf_xxxxxxxxxxxxxxxxxxxx' or not HF_TOKEN.startswith('hf_'):
+    print("[ERROR] Invalid HuggingFace token")
+    print("  -> Replace HF_TOKEN with your actual token from https://huggingface.co/settings/tokens")
+    raise ValueError("HuggingFace token not configured")
 
 try:
     huggingface_model = HuggingFaceModel(
